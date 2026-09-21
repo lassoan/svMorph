@@ -14,7 +14,6 @@ from __future__ import annotations
 import time
 
 import numpy as np
-from scipy.spatial import cKDTree
 
 from svmorph.backend import Array, index_set, jit, scan
 from svmorph.backend import xp as jnp
@@ -800,6 +799,11 @@ def compute_sdf_contact_displacements(
     # closer than `influence_radius` will receive a displacement that
     # decays smoothly with distance to the contact front.
     start_time = time.time()
+    # SciPy is asked for here rather than at the top of the module: importing svmorph then costs
+    # nothing where the contact search is not used, and there are environments where SciPy cannot
+    # be loaded at all (in a browser its BLAS clashes with the one ITK brings).
+    from scipy.spatial import cKDTree
+
     contact_tree = cKDTree(in_contact_vertices, leafsize=32)
     query_points = np.concatenate((data_points_masked, movables_centerline_points), axis=0)
     dist_min, _ = contact_tree.query(query_points, k=1, distance_upper_bound=influence_radius, workers=-1)
