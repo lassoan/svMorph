@@ -21,7 +21,9 @@ virtual stenting method that mimics stent-wall interaction during deployment, an
 **regularized Kelvinlet** displacement kernels (de Goes & James, 2017, Pham et al., 2024)
 for virtual aneurysm and synthetic stenosis modeling.
 All heavy numerics are JIT-compiled with [JAX](https://github.com/jax-ml/jax) for
-real-time feedback on commodity hardware.
+real-time feedback on commodity hardware, and fall back to plain
+[NumPy](https://numpy.org/) where JAX cannot be installed (see
+[Array backend](#array-backend)).
 
 > **Citation guidance**
 > - If you use **SDFStent** (virtual stenting), please cite the **SDFStent paper** (reference forthcoming).
@@ -53,7 +55,7 @@ All four modes are available through both the **interactive GUI** (PyQt6 + VTK) 
 | NumPy | 1.24+ | |
 | SciPy | 1.10+ | KD-tree for influence-zone queries |
 | VTK | 9.3 | VTP mesh I/O and rendering |
-| JAX (CPU) | 0.4.30 | JIT compilation of deformation kernels |
+| JAX (CPU) | 0.4.30 | JIT compilation of the deformation kernels; not installed on Emscripten (WebAssembly), where NumPy is used |
 | PyQt6 | 6.7 | GUI only — not required for headless scripts |
 
 ---
@@ -466,7 +468,28 @@ svmorph/
 └── logging.py             # Structured logging with custom TIMING level
 ```
 
-The `core/` subpackage is **dependency-light** (JAX, NumPy, SciPy only) and carries
+### Array backend
+
+The kernels are written against `svmorph.backend`, which is JAX where JAX imports and NumPy
+where it does not. svMorph never differentiates anything — the gradients in the SDF kernels are
+written out by hand — so JAX is used here as a NumPy that compiles and vectorizes, and the
+package computes the same results without it, to about single-precision agreement (JAX computes
+in float32 by default, NumPy in float64).
+
+That matters wherever JAX cannot go: `jaxlib` is XLA, built for a handful of platforms, and
+there is no WebAssembly build of it, so `import jax` fails in a browser — which is where
+[3D Slicer runs as SlicerWeb](https://github.com/Slicer/Slicer) through Pyodide — while NumPy
+and SciPy are there.
+
+Set `SVMORPH_BACKEND=numpy` in the environment to compute with NumPy even where JAX is
+installed; this is how the two backends are compared against each other:
+
+```bash
+pytest tests                          # JAX, if it is installed
+SVMORPH_BACKEND=numpy pytest tests    # NumPy
+```
+
+The `core/` subpackage is **dependency-light** (NumPy and SciPy, with JAX if it is there) and carries
 no VTK or Qt dependency, making it straightforward for downstream tools — such as
 [3D Slicer](https://www.slicer.org/) extensions or [ParaView](https://www.paraview.org/)
 plugins — to import and build upon the deformation engine independently:

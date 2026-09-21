@@ -1,16 +1,17 @@
 """Data-dict management, material constants, and displacement updates.
 
-Pure NumPy / JAX — no VTK or Qt imports.
+Arrays only (through svmorph.backend) - no VTK or Qt imports.
 """
 
 from __future__ import annotations
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 
+from svmorph.backend import Array
+from svmorph.backend import xp as jnp
 
-def compute_material_constants(mu: float, nu: float) -> tuple[jax.Array, jax.Array]:
+
+def compute_material_constants(mu: float, nu: float) -> tuple[Array, Array]:
     """Return Kelvinlet material parameters (a, b) from shear modulus and Poisson ratio."""
     a = 1 / (4 * jnp.pi * mu)
     b = a / (4 * (1 - nu))
@@ -23,7 +24,7 @@ def apply_displacements(data: dict, displacements: np.ndarray, mesh_type: str) -
     return data
 
 
-def get_centroid(points: jax.Array) -> jax.Array:
+def get_centroid(points: Array) -> Array:
     """Return the centroid of *points* as a (1, D) array."""
     centroid = jnp.mean(points, axis=0, keepdims=True)
     return centroid

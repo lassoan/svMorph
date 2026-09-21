@@ -37,7 +37,9 @@ dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
     "vtk>=9.2",
-    "jax>=0.4",
+    # JAX compiles and vectorizes the kernels. There is no jaxlib for WebAssembly, so in a browser
+    # (Pyodide) it is left out and the kernels run on NumPy instead; see svmorph/backend.py.
+    "jax>=0.4; sys_platform != 'emscripten'",
 ]
 
 [project.optional-dependencies]

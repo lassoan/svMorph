@@ -24,7 +24,8 @@ from __future__ import annotations
 import argparse
 import time
 
-import jax.numpy as jnp
+from svmorph.backend import index_set
+from svmorph.backend import xp as jnp
 
 from svmorph.core import deformation, geometry, mesh_data
 from svmorph.core.units import L
@@ -55,7 +56,7 @@ def straighten_axis(vertices: jnp.ndarray, strength: float) -> jnp.ndarray:
         point = vertices[i]
         proj_len = jnp.dot(point - start, direction)
         closest = start + proj_len * direction
-        vertices = vertices.at[i].set(point + strength * (closest - point))
+        vertices = index_set(vertices, i, point + strength * (closest - point))
     return vertices
 
 

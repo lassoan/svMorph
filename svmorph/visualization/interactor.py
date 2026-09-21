@@ -40,7 +40,8 @@ from svmorph.core.defaults import (
 from svmorph.visualization import vtk_io
 import numpy as np
 from vtk.util.numpy_support import numpy_to_vtk, get_vtk_array_type
-import jax.numpy as jnp
+from svmorph.backend import index_set
+from svmorph.backend import xp as jnp
 import time
 from svmorph.logging import get_logger
 
@@ -432,7 +433,7 @@ class MeshInteractor(vtkInteractorStyleTrackballCamera):
                 projection_length = jnp.dot(to_start, direction)
                 closest_point_on_line = start_point + projection_length * direction
                 displacement = closest_point_on_line - point
-                vertices = vertices.at[i].set(point + strength * displacement)
+                vertices = index_set(vertices, i, point + strength * displacement)
             return vertices
 
         start_point = self.stent_axis_vertices[0]

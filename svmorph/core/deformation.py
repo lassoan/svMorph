@@ -3,8 +3,10 @@
 Implements regularized Kelvinlet force responses, smooth-minimum SDF
 evaluation against capsule stent geometries, and top-level routines that
 assemble per-vertex displacement fields for aneurysm inflation, stenosis
-creation, and SDF-contact stent deployment.  All heavy numerics use JAX
-for automatic vectorization and JIT compilation.
+creation, and SDF-contact stent deployment.  All heavy numerics are
+written against svmorph.backend, which is JAX where it is installed and
+NumPy where it is not; every array operation here is batched over the
+mesh points, so both backends do the work in compiled code.
 """
 
 from __future__ import annotations
@@ -14,25 +16,25 @@ import time
 import numpy as np
 from scipy.spatial import cKDTree
 
-import jax as jx
-import jax.numpy as jnp
+from svmorph.backend import Array, index_set, jit, scan
+from svmorph.backend import xp as jnp
 
 from svmorph.core.units import L
 from svmorph.logging import get_logger
 
 logger = get_logger(__name__)
 
-def compute_householder_matrices(cross_section_normals: jx.Array) -> jx.Array:
+def compute_householder_matrices(cross_section_normals: Array) -> Array:
     """Compute Householder reflection matrices that rotate each normal to the z-axis.
 
     Parameters
     ----------
-    cross_section_normals : jx.Array
+    cross_section_normals : Array
         Unit normals for each cross-section, shape ``(N, 3)``.
 
     Returns
     -------
-    jx.Array
+    Array
         Stack of 3x3 Householder matrices, shape ``(N, 3, 3)``.
     """
     z_axis = jnp.array([0, 0, 1])
@@ -78,26 +80,26 @@ def set_force_center(data: dict, point_id: int) -> dict:
     data["nodes"]["force_center_point_id"] = point_id
     return data
 
-def mix(a: jx.Array, b: jx.Array, t: jx.Array) -> jx.Array:
+def mix(a: Array, b: Array, t: Array) -> Array:
     """Linearly interpolate between *a* and *b* by factor *t*.
 
     Parameters
     ----------
-    a, b : jx.Array
+    a, b : Array
         Endpoint values.
-    t : jx.Array
+    t : Array
         Interpolation factor(s); 0 gives *a*, 1 gives *b*.
 
     Returns
     -------
-    jx.Array
+    Array
         Interpolated result, same shape as the inputs.
     """
     return a + (b - a) * t
 
 def smin_and_gradient(
-    a: jx.Array, da: jx.Array, b: jx.Array, db: jx.Array, k: float | None = None,
-) -> tuple[jx.Array, jx.Array]:
+    a: Array, da: Array, b: Array, db: Array, k: float | None = None,
+) -> tuple[Array, Array]:
     """Smooth-minimum of two scalar fields with gradient blending.
 
     Uses polynomial smooth-min (k-smin) to approximate ``min(a, b)``
@@ -106,18 +108,18 @@ def smin_and_gradient(
 
     Parameters
     ----------
-    a, b : jx.Array
+    a, b : Array
         Scalar distance fields.
-    da, db : jx.Array
+    da, db : Array
         Gradients (or direction vectors) associated with *a* and *b*.
     k : float or None
         Smoothing radius.  ``None`` (default) uses ``0.01 * L()``.
 
     Returns
     -------
-    value : jx.Array
+    value : Array
         Smooth minimum of *a* and *b*.
-    grad : jx.Array
+    grad : Array
         Blended gradient.
     """
     if k is None:
@@ -128,54 +130,63 @@ def smin_and_gradient(
     m = h**2 * k / 4.0
     # Use jnp.where to choose between the two cases in a jittable way
     value = jnp.where(a < b, a - m, b - m)
-    grad  = jnp.where(a < b, mix(da, db, n), mix(da, db, 1.0 - n))
+    # da and db carry a trailing vector axis that a and b have not got
+    a_closer = (a < b)[..., None]
+    blend = n[..., None]
+    grad = jnp.where(a_closer, mix(da, db, blend), mix(da, db, 1.0 - blend))
     return value, grad
 
 def fold_smin(
-    carry: tuple[jx.Array, jx.Array], elem: tuple[jx.Array, jx.Array],
-) -> tuple[tuple[jx.Array, jx.Array], None]:
-    """``jax.lax.scan``-compatible fold step that accumulates smooth-min distance and direction.
+    carry: tuple[Array, Array], elem: tuple[Array, Array],
+) -> tuple[tuple[Array, Array], None]:
+    """Fold step that accumulates smooth-min distance and direction over one more segment.
 
     Parameters
     ----------
-    carry : tuple[jx.Array, jx.Array]
-        Running ``(min_distance, min_direction)`` accumulator.
-    elem : tuple[jx.Array, jx.Array]
-        Next ``(distance, direction)`` element.
+    carry : tuple[Array, Array]
+        Running ``(min_distance, min_direction)`` accumulator, shapes ``(N,)`` and ``(N, 3)``.
+    elem : tuple[Array, Array]
+        Next segment's ``(distance, direction)``, same shapes.
 
     Returns
     -------
-    tuple[tuple[jx.Array, jx.Array], None]
-        Updated carry and a ``None`` scan placeholder.
+    tuple[tuple[Array, Array], None]
+        Updated carry and a scan placeholder.
     """
     cur_min_d, cur_min_dir = carry
     d, direction = elem
     new_d, new_dir = smin_and_gradient(cur_min_d, cur_min_dir, d, direction)
     return (new_d, new_dir), None
 
-def compute_min_dist_and_direction(d: jx.Array, direction: jx.Array) -> tuple[jx.Array, jx.Array]:
-    """Reduce per-segment distances and directions to a single smooth-minimum pair.
+def compute_min_dist_and_direction(d: Array, direction: Array) -> tuple[Array, Array]:
+    """Reduce per-segment distances and directions to a single smooth-minimum pair per point.
+
+    The reduction runs over the segment axis - segments number in the tens, while the points
+    number in the hundreds of thousands - so every step of it works on all of the points at once.
 
     Parameters
     ----------
-    d : jx.Array
-        Per-segment signed distances, shape ``(num_segments,)``.
-    direction : jx.Array
-        Per-segment direction vectors, shape ``(num_segments, 3)``.
+    d : Array
+        Per-segment signed distances, shape ``(N, num_segments)``.
+    direction : Array
+        Per-segment direction vectors, shape ``(N, num_segments, 3)``.
 
     Returns
     -------
-    final_d : jx.Array
-        Smooth-minimum distance (scalar).
-    final_dir : jx.Array
-        Blended direction vector, shape ``(3,)``.
+    final_d : Array
+        Smooth-minimum distance per point, shape ``(N,)``.
+    final_dir : Array
+        Blended direction vector per point, shape ``(N, 3)``.
     """
-    (final_d, final_dir), _ = jx.lax.scan(fold_smin, (d[0], direction[0]), (d[1:], direction[1:]))
+    # scan wants the axis it folds over first; for the points that is the segment axis.
+    distances = jnp.moveaxis(d[:, 1:], 1, 0)
+    directions = jnp.moveaxis(direction[:, 1:, :], 1, 0)
+    (final_d, final_dir), _ = scan(fold_smin, (d[:, 0], direction[:, 0, :]), (distances, directions))
     return final_d, final_dir
 
-@jx.jit
-def capsule_sdf(p: jx.Array, stent_vertices: jx.Array, r: float | jx.Array,
-                cap_height_fraction: float = 1.0) -> jx.Array:
+@jit
+def capsule_sdf(p: Array, stent_vertices: Array, r: float | Array,
+                cap_height_fraction: float = 1.0) -> Array:
     """Evaluate the signed distance field of a (tapered) capsule-chain stent.
 
     Each consecutive pair of *stent_vertices* defines a capsule segment.
@@ -184,11 +195,11 @@ def capsule_sdf(p: jx.Array, stent_vertices: jx.Array, r: float | jx.Array,
 
     Parameters
     ----------
-    p : jx.Array
+    p : Array
         Query points, shape ``(N, 3)``.
-    stent_vertices : jx.Array
+    stent_vertices : Array
         Stent axis vertices, shape ``(V, 3)``.
-    r : float or jx.Array
+    r : float or Array
         Capsule radius: scalar, or per-vertex radii of shape ``(V,)``,
         linearly interpolated along each segment (arbitrary radius profile
         along the centerline, e.g. a flared end).
@@ -200,18 +211,18 @@ def capsule_sdf(p: jx.Array, stent_vertices: jx.Array, r: float | jx.Array,
 
     Returns
     -------
-    jx.Array
+    Array
         Signed distance for each query point, shape ``(N, 1)``.
     """
     dist_to_surface_all, direction_all = _tapered_capsule_segment_distances(
         p, stent_vertices, r, cap_height_fraction)
-    final_dist_to_surface, _ = jx.vmap(compute_min_dist_and_direction)(dist_to_surface_all, direction_all)
+    final_dist_to_surface, _ = compute_min_dist_and_direction(dist_to_surface_all, direction_all)
     final_dist_to_surface = final_dist_to_surface[:, None]
     return final_dist_to_surface
 
 def _tapered_capsule_segment_distances(
-    p: jx.Array, stent_vertices: jx.Array, r: float | jx.Array, cap_height_fraction: float,
-) -> tuple[jx.Array, jx.Array]:
+    p: Array, stent_vertices: Array, r: float | Array, cap_height_fraction: float,
+) -> tuple[Array, Array]:
     """Per-segment signed distances and outward directions of a tapered capsule chain.
 
     Each consecutive pair of *stent_vertices* defines a capsule segment.  The
@@ -232,11 +243,11 @@ def _tapered_capsule_segment_distances(
 
     Parameters
     ----------
-    p : jx.Array
+    p : Array
         Query points, shape ``(N, 3)``.
-    stent_vertices : jx.Array
+    stent_vertices : Array
         Stent axis vertices, shape ``(V, 3)``.
-    r : float or jx.Array
+    r : float or Array
         Capsule radius: scalar, or per-vertex radii of shape ``(V,)``.
     cap_height_fraction : float
         Axial semi-axis of the capsule end caps as a fraction of the local
@@ -244,9 +255,9 @@ def _tapered_capsule_segment_distances(
 
     Returns
     -------
-    dist_to_surface_all : jx.Array
+    dist_to_surface_all : Array
         Per-segment signed distances, shape ``(N, num_segments)``.
-    direction_all : jx.Array
+    direction_all : Array
         Per-segment outward direction vectors, shape ``(N, num_segments, 3)``.
     """
     r = jnp.broadcast_to(jnp.asarray(r), (stent_vertices.shape[0],))
@@ -267,9 +278,9 @@ def _tapered_capsule_segment_distances(
     return dist_to_surface_all, direction_all
 
 def kelvinlets_truncated_spherical_contraction(
-    rv: jx.Array, f_scale: float,
+    rv: Array, f_scale: float,
     s: float, r_min: float, r_max: float,
-) -> jx.Array:
+) -> Array:
     """Compute inward radial displacements for stenosis creation.
 
     Points within the cylindrical annulus [*r_min*, *r_max*] are displaced
@@ -278,7 +289,7 @@ def kelvinlets_truncated_spherical_contraction(
 
     Parameters
     ----------
-    rv : jx.Array
+    rv : Array
         Centerline-aligned relative positions, shape ``(N, 3)``.
     f_scale : float
         Force magnitude scaling factor.
@@ -291,7 +302,7 @@ def kelvinlets_truncated_spherical_contraction(
 
     Returns
     -------
-    jx.Array
+    Array
         Per-point displacement vectors, shape ``(N, 3)``.
     """
     rx, ry, rz = rv[:, 0], rv[:, 1], rv[:, 2]
@@ -299,14 +310,14 @@ def kelvinlets_truncated_spherical_contraction(
     re_no_z = jnp.sqrt(rx**2 + ry**2)
     inner_mask = (re_no_z >= r_min).astype(int)
     outer_mask = (re <= r_max).astype(int)
-    rv = rv.at[:, 2].set(0 * rv[:, 2])
+    rv = index_set(rv, (slice(None), 2), 0 * rv[:, 2])
     displacements = f_scale * (r_max - r_min) * ((re[:, None] / r_max) ** 2 - 1) ** 2 * (-s) * rv
     displacements = displacements * inner_mask[:, None] * outer_mask[:, None]
     return displacements
 
 def kelvinlets_truncated_spherical_expansion(
-    rv: jx.Array, a: float, b: float, eps: float, s: float,
-) -> jx.Array:
+    rv: Array, a: float, b: float, eps: float, s: float,
+) -> Array:
     """Compute outward radial displacements for aneurysm sculpting.
 
     Uses the scaling regularized Kelvinlet (F = s·I, Eq. 14 in de Goes &
@@ -315,7 +326,7 @@ def kelvinlets_truncated_spherical_expansion(
 
     Parameters
     ----------
-    rv : jx.Array
+    rv : Array
         Centerline-aligned relative positions, shape ``(N, 3)``.
     a, b : float
         Kelvinlet material parameters.
@@ -326,7 +337,7 @@ def kelvinlets_truncated_spherical_expansion(
 
     Returns
     -------
-    jx.Array
+    Array
         Per-point displacement vectors, shape ``(N, 3)``.
     """
     f_scale = 0.01 * L()**3
@@ -334,17 +345,17 @@ def kelvinlets_truncated_spherical_expansion(
     re = jnp.sqrt(rx**2 + ry**2 + rz**2 + eps**2)
     re3 = re[:, None]**3
     re5 = re[:, None]**5
-    rv = rv.at[:, 2].set(0 * rv[:, 2])
+    rv = index_set(rv, (slice(None), 2), 0 * rv[:, 2])
     displacements = f_scale * (2 * b - a) * (1 / re3 + 3 * eps**2 / (2 * re5)) * s * rv
 
     return displacements
 
-@jx.jit
+@jit
 def smin_sdf_capsule_contact_sculpt(
-    rv: jx.Array, stent_vertices: jx.Array,
-    r_current: float | jx.Array,
+    rv: Array, stent_vertices: Array,
+    r_current: float | Array,
     cap_height_fraction: float = 1.0,
-) -> tuple[jx.Array, jx.Array]:
+) -> tuple[Array, Array]:
     """Compute smooth-min SDF distances and outward directions from a capsule-chain stent.
 
     Evaluates the signed distance from each query point to the nearest
@@ -354,11 +365,11 @@ def smin_sdf_capsule_contact_sculpt(
 
     Parameters
     ----------
-    rv : jx.Array
+    rv : Array
         Query points, shape ``(N, 3)``.
-    stent_vertices : jx.Array
+    stent_vertices : Array
         Stent axis vertices, shape ``(V, 3)``.
-    r_current : float or jx.Array
+    r_current : float or Array
         Current stent deployment radius: scalar, or per-vertex radii of
         shape ``(V,)``, linearly interpolated along each segment (arbitrary
         radius profile along the centerline, e.g. a flared end).
@@ -370,24 +381,24 @@ def smin_sdf_capsule_contact_sculpt(
 
     Returns
     -------
-    final_dist_to_surface : jx.Array
+    final_dist_to_surface : Array
         Signed distance to stent surface, shape ``(N, 1)``.
-    final_direction : jx.Array
+    final_direction : Array
         Unit outward direction from the stent axis, shape ``(N, 3)``.
     """
     dist_to_surface_all, direction_all = _tapered_capsule_segment_distances(
         rv, stent_vertices, r_current, cap_height_fraction)
     # Vectorize the folding over all mesh points:
-    final_dist_to_surface, final_direction = jx.vmap(compute_min_dist_and_direction)(dist_to_surface_all, direction_all)
+    final_dist_to_surface, final_direction = compute_min_dist_and_direction(dist_to_surface_all, direction_all)
     final_dist_to_surface = final_dist_to_surface[:, None]
     return final_dist_to_surface, final_direction
 
-@jx.jit
+@jit
 def get_scaling_kelvinlet_displacements_inner(
-    data_points: jx.Array, rotation_matrices: jx.Array,
-    centers: jx.Array, a: float, b: float, eps: float, s: float,
+    data_points: Array, rotation_matrices: Array,
+    centers: Array, a: float, b: float, eps: float, s: float,
     surface_mesh_scale_factor: float | None,
-) -> jx.Array:
+) -> Array:
     """JIT-compiled inner loop for scaling Kelvinlet displacement computation.
 
     Rotates mesh points into the center's local frame, computes sculpt
@@ -396,11 +407,11 @@ def get_scaling_kelvinlet_displacements_inner(
 
     Parameters
     ----------
-    data_points : jx.Array
+    data_points : Array
         Surface mesh vertices, shape ``(N, 3)``.
-    rotation_matrices : jx.Array
+    rotation_matrices : Array
         Householder matrices, shape ``(1, 3, 3)``.
-    centers : jx.Array
+    centers : Array
         Kelvinlet force center, shape ``(1, 3)``.
     a, b : float
         Kelvinlet material parameters.
@@ -413,7 +424,7 @@ def get_scaling_kelvinlet_displacements_inner(
 
     Returns
     -------
-    displacement : jx.Array
+    displacement : Array
         Net displacement per mesh point, shape ``(N, 3)``.
     """
     rv = data_points - centers
@@ -483,12 +494,12 @@ def find_stenosis_minimum_radius_representative(
     logger.debug(f"Estimated current radius: {current_radius}")
     return index_for_min_rz, current_radius
 
-@jx.jit
+@jit
 def get_stenosis_displacements_inner(
-    data_points: jx.Array, rotation_matrices: jx.Array,
-    centers: jx.Array, s: float,
+    data_points: Array, rotation_matrices: Array,
+    centers: Array, s: float,
     r_min: float, r_max: float,
-) -> tuple[jx.Array, jx.Array]:
+) -> tuple[Array, Array]:
     """JIT-compiled inner loop for stenosis (inward shrink) displacements.
 
     Rotates mesh points into the local frame, applies the truncated-sphere
@@ -496,11 +507,11 @@ def get_stenosis_displacements_inner(
 
     Parameters
     ----------
-    data_points : jx.Array
+    data_points : Array
         Surface mesh vertices, shape ``(N, 3)``.
-    rotation_matrices : jx.Array
+    rotation_matrices : Array
         Householder matrices, shape ``(1, 3, 3)``.
-    centers : jx.Array
+    centers : Array
         Kelvinlet center, shape ``(1, 3)``.
     s : float
         Signed force scale.
@@ -511,9 +522,9 @@ def get_stenosis_displacements_inner(
 
     Returns
     -------
-    displacement : jx.Array
+    displacement : Array
         Per-point displacement vectors, shape ``(N, 3)``.
-    step_size : jx.Array
+    step_size : Array
         Scalar step size for radius tracking.
     """
     rv = data_points - centers
@@ -526,7 +537,7 @@ def get_stenosis_displacements_inner(
 
 def compute_aneurysm_displacements(
     data: dict, a: float, b: float, eps: float, s: float,
-    surface_mesh_scale_factor: float | None,     force_center_normal: jx.Array,
+    surface_mesh_scale_factor: float | None,     force_center_normal: Array,
 ) -> np.ndarray:
     """Compute Kelvinlet-based outward surface displacements for aneurysm creation.
 
@@ -545,7 +556,7 @@ def compute_aneurysm_displacements(
         Signed force scale.
     surface_mesh_scale_factor : float | None
         Optional displacement scaling.
-    force_center_normal : jx.Array
+    force_center_normal : Array
         Tangent direction at the force center, shape ``(3,)``.
 
     Returns
@@ -566,8 +577,8 @@ def compute_aneurysm_displacements(
 
 def compute_stenosis_displacements(
     data: dict, s: float,
-    force_center_normal: jx.Array, r_min: float, r_max: float,
-) -> tuple[np.ndarray, jx.Array]:
+    force_center_normal: Array, r_min: float, r_max: float,
+) -> tuple[np.ndarray, Array]:
     """Compute inward surface displacements for stenosis creation.
 
     Assembles query-point geometry and delegates to the JIT-compiled
@@ -579,7 +590,7 @@ def compute_stenosis_displacements(
         Simulation data dictionary.
     s : float
         Signed force scale (positive → inward).
-    force_center_normal : jx.Array
+    force_center_normal : Array
         Tangent direction at the force center, shape ``(3,)``.
     r_min : float
         Inner annular radius.
@@ -590,7 +601,7 @@ def compute_stenosis_displacements(
     -------
     displacements : np.ndarray
         Per-vertex displacement vectors, shape ``(N, 3)``.
-    step_size : jx.Array
+    step_size : Array
         Scalar step size for radius tracking.
     """
     force_center_point_id = data["nodes"]["force_center_point_id"]
@@ -604,20 +615,20 @@ def compute_stenosis_displacements(
     )
     return np.array(displacements), step_size
 
-@jx.jit
+@jit
 def stent_bounding_box(
-    data_points: jx.Array, stent_vertices: jx.Array,
+    data_points: Array, stent_vertices: Array,
     target_stent_radius: float, influence_radius: float, contact_distance: float,
-) -> jx.Array:
+) -> Array:
     """Compute a boolean mask selecting points inside the padded stent bounding box.
 
     Parameters
     ----------
-    data_points : jx.Array
+    data_points : Array
         Mesh vertices, shape ``(N, 3)``.
-    stent_vertices : jx.Array
+    stent_vertices : Array
         Stent axis vertices, shape ``(V, 3)``.
-    target_stent_radius : float or jx.Array
+    target_stent_radius : float or Array
         Target stent radius (the maximum is used when a per-vertex radius
         array is given).
     influence_radius : float
@@ -627,7 +638,7 @@ def stent_bounding_box(
 
     Returns
     -------
-    jx.Array
+    Array
         Boolean mask of length *N*.
     """
     max_stent_radius = jnp.max(jnp.asarray(target_stent_radius))
@@ -637,9 +648,9 @@ def stent_bounding_box(
     return mask
 
 def compute_sdf_contact_displacements(
-    data: dict, stent_vertices: jx.Array,
+    data: dict, stent_vertices: Array,
     s: float,
-    target_stent_radius: float | jx.Array, current_stent_radius: float | jx.Array, *,
+    target_stent_radius: float | Array, current_stent_radius: float | Array, *,
     influence_radius: float | None = None, contact_distance: float | None = None,
     f_scale: float | None = None, cap_height_fraction: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray, float]:
@@ -658,15 +669,15 @@ def compute_sdf_contact_displacements(
     ----------
     data : dict
         Simulation data dictionary with surface and centerline arrays.
-    stent_vertices : jx.Array
+    stent_vertices : Array
         Stent axis vertices, shape ``(V, 3)``.
     s : float
         Signed force scale.
-    target_stent_radius : float or jx.Array
+    target_stent_radius : float or Array
         Target stent radius for SDF computation (scalar, or per-vertex radii
         of shape ``(V,)``; only the maximum is used, for bounding-box
         culling).
-    current_stent_radius : float or jx.Array
+    current_stent_radius : float or Array
         Current deployment radius of the stent: scalar, or per-vertex radii
         of shape ``(V,)``, linearly interpolated along each capsule segment
         so the stent can follow an arbitrary radius profile along the

@@ -14,8 +14,8 @@ from collections import defaultdict
 
 import vtk
 import numpy as np
-import jax
-import jax.numpy as jnp
+from svmorph.backend import Array
+from svmorph.backend import xp as jnp
 from vtk.util.numpy_support import vtk_to_numpy as v2n
 from vtkmodules.vtkIOXML import vtkXMLPolyDataReader, vtkXMLPolyDataWriter
 
@@ -233,7 +233,7 @@ def extract_inscribed_sphere_radii(centerline_polydata: vtk.vtkPolyData) -> np.n
 
 def get_centerline_point_and_normal(
     centerline_polydata: vtk.vtkPolyData, point_id: int,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[Array, Array]:
     """Return the 3-D position and unit tangent at a centerline point.
 
     Parameters
@@ -245,12 +245,12 @@ def get_centerline_point_and_normal(
 
     Returns
     -------
-    point : jax.Array
+    point : Array
         Coordinates of the point, shape ``(3,)``.
-    normal : jax.Array
+    normal : Array
         Unit tangent vector at the point, shape ``(3,)``.
     """
-    point = jnp.array(centerline_polydata.GetPoint(point_id))  # Directly convert to JAX array
+    point = jnp.array(centerline_polydata.GetPoint(point_id))  # straight into an array of the backend
     num_centerline_points = centerline_polydata.GetNumberOfPoints()
     if 0 < point_id < num_centerline_points - 1:
         next_point = jnp.array(centerline_polydata.GetPoint(point_id + 1))

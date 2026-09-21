@@ -23,12 +23,12 @@ def _flat_maps(n: int):
     return parent_tip_map, segment_base_mask
 
 
-def test_output_is_jax_array():
-    import jax.numpy as jnp
+def test_output_is_backend_array():
+    from svmorph.backend import Array
     pts = _straight_line()
     ptm, sbm = _flat_maps(len(pts))
     result = resample_stent_axis(pts, ptm, sbm, 10, 0.5, 0.1, sampling_direction=-1)
-    assert isinstance(result, jnp.ndarray)
+    assert isinstance(result, Array)
 
 
 def test_resampled_length_proximal():

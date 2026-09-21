@@ -8,8 +8,9 @@ axis vertices along a selected centerline segment.
 from __future__ import annotations
 
 import numpy as np
-import jax
-import jax.numpy as jnp
+
+from svmorph.backend import Array
+from svmorph.backend import xp as jnp
 
 from svmorph.logging import get_logger
 
@@ -24,7 +25,7 @@ def resample_stent_axis(
     desired_total_length: float,
     desired_segment_length: float,
     sampling_direction: int = -1,
-) -> jax.Array:
+) -> Array:
     """Extract and resample a polyline subsegment at uniform arc-length intervals.
 
     Walks along the centerline from *starting_point_idx* in the given
@@ -52,7 +53,7 @@ def resample_stent_axis(
 
     Returns
     -------
-    jax.Array
+    Array
         Resampled stent axis vertices, shape ``(M, 3)``.
     """
     if sampling_direction not in (-1, 1):
