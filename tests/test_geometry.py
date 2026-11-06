@@ -9,6 +9,9 @@ from svmorph.core.geometry import (
     stent_radius_profile,
 )
 
+# Every test here runs once under each backend that is installed (tests/conftest.py)
+pytestmark = pytest.mark.usefixtures("each_backend")
+
 
 def _straight_line(n: int = 20, length: float = 2.0) -> np.ndarray:
     """Return n evenly-spaced points along the X axis from 0 to length."""

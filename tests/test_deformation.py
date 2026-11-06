@@ -8,6 +8,9 @@ import pytest
 from svmorph.core.deformation import capsule_sdf, smin_sdf_capsule_contact_sculpt
 from svmorph.core.units import set_unit_scale
 
+# Every test here runs once under each backend that is installed (tests/conftest.py)
+pytestmark = pytest.mark.usefixtures("each_backend")
+
 
 @pytest.fixture(autouse=True)
 def _unit_scale():

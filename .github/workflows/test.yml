@@ -34,7 +34,8 @@ jobs:
       - name: Install core dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ".[dev]"
+          # warp: so that the Warp backend's tests run (on the CPU here) instead of skipping
+          pip install ".[dev,warp]"
 
       - name: Run tests with coverage
         run: |

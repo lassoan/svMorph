@@ -44,6 +44,10 @@ dependencies = [
 
 [project.optional-dependencies]
 gui = ["pyqt6>=6.7,<6.10"]
+# NVIDIA Warp evaluates the stent SDF as a kernel, on a CUDA GPU or the CPU. Chosen with
+# SVMORPH_BACKEND=warp or svmorph.backend.set_backend("warp"), never by default, so it is not a
+# dependency: it is over 100 MB and nothing uses it unasked.
+warp = ["warp-lang>=1.0"]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",

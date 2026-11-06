@@ -4,9 +4,13 @@ Implements regularized Kelvinlet force responses, smooth-minimum SDF
 evaluation against capsule stent geometries, and top-level routines that
 assemble per-vertex displacement fields for aneurysm inflation, stenosis
 creation, and SDF-contact stent deployment.  All heavy numerics are
-written against svmorph.backend, which is JAX where it is installed and
-NumPy where it is not; every array operation here is batched over the
-mesh points, so both backends do the work in compiled code.
+written against svmorph.backend, which is JAX, NumPy or Warp as chosen
+there; every array operation here is batched over the mesh points, so
+JAX and NumPy both do the work in compiled code.  Under Warp the
+capsule-chain SDF - the one computation here that is every mesh point
+against every stent segment - is a kernel (svmorph.core.sdf_warp), and
+on a GPU so is the whole stent deployment step; the Kelvinlet kernels,
+which are linear in the mesh, run on NumPy.
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ import time
 
 import numpy as np
 
-from svmorph.backend import Array, index_set, jit, scan
+from svmorph.backend import Array, get_backend, index_set, jit, scan
 from svmorph.backend import xp as jnp
 
 from svmorph.core.units import L
@@ -183,7 +187,6 @@ def compute_min_dist_and_direction(d: Array, direction: Array) -> tuple[Array, A
     (final_d, final_dir), _ = scan(fold_smin, (d[:, 0], direction[:, 0, :]), (distances, directions))
     return final_d, final_dir
 
-@jit
 def capsule_sdf(p: Array, stent_vertices: Array, r: float | Array,
                 cap_height_fraction: float = 1.0) -> Array:
     """Evaluate the signed distance field of a (tapered) capsule-chain stent.
@@ -213,11 +216,36 @@ def capsule_sdf(p: Array, stent_vertices: Array, r: float | Array,
     Array
         Signed distance for each query point, shape ``(N, 1)``.
     """
+    if get_backend() == "warp":
+        final_dist_to_surface, _ = _capsule_chain_sdf_warp(p, stent_vertices, r, cap_height_fraction)
+        return final_dist_to_surface
+    return _capsule_sdf_arrays(p, stent_vertices, r, cap_height_fraction)
+
+@jit
+def _capsule_sdf_arrays(p: Array, stent_vertices: Array, r: float | Array,
+                        cap_height_fraction: float) -> Array:
+    """:func:`capsule_sdf` on the array backends (JAX, NumPy)."""
     dist_to_surface_all, direction_all = _tapered_capsule_segment_distances(
         p, stent_vertices, r, cap_height_fraction)
     final_dist_to_surface, _ = compute_min_dist_and_direction(dist_to_surface_all, direction_all)
     final_dist_to_surface = final_dist_to_surface[:, None]
     return final_dist_to_surface
+
+def _capsule_chain_sdf_warp(
+    p: Array, stent_vertices: Array, r: float | Array, cap_height_fraction: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """The capsule-chain SDF and its direction from the Warp kernel, shapes ``(N, 1)`` and ``(N, 3)``.
+
+    Warp is imported here and not at the top of the module: it is there only where the Warp
+    backend was asked for, and importing it initialises its runtime.
+    """
+    from svmorph.core import sdf_warp
+
+    distance, direction = sdf_warp.capsule_chain_distance_and_direction(
+        p, stent_vertices, r, cap_height_fraction,
+        # the smoothing radius smin_and_gradient uses when it is given none
+        smoothing=0.01 * L())
+    return distance[:, None], direction
 
 def _tapered_capsule_segment_distances(
     p: Array, stent_vertices: Array, r: float | Array, cap_height_fraction: float,
@@ -259,6 +287,11 @@ def _tapered_capsule_segment_distances(
     direction_all : Array
         Per-segment outward direction vectors, shape ``(N, num_segments, 3)``.
     """
+    # Arrays made under another backend are taken over into this one. A JAX array outranks a NumPy
+    # one in arithmetic, so a stent axis resampled before set_backend("numpy") would otherwise
+    # carry the whole evaluation back into JAX, and nothing would say so.
+    p = jnp.asarray(p)
+    stent_vertices = jnp.asarray(stent_vertices)
     r = jnp.broadcast_to(jnp.asarray(r), (stent_vertices.shape[0],))
     ba_all = jnp.diff(stent_vertices, axis=0)
     pa_all = p[:, None, :] - stent_vertices[None, :-1, :]
@@ -349,7 +382,6 @@ def kelvinlets_truncated_spherical_expansion(
 
     return displacements
 
-@jit
 def smin_sdf_capsule_contact_sculpt(
     rv: Array, stent_vertices: Array,
     r_current: float | Array,
@@ -385,6 +417,17 @@ def smin_sdf_capsule_contact_sculpt(
     final_direction : Array
         Unit outward direction from the stent axis, shape ``(N, 3)``.
     """
+    if get_backend() == "warp":
+        return _capsule_chain_sdf_warp(rv, stent_vertices, r_current, cap_height_fraction)
+    return _smin_sdf_capsule_contact_sculpt_arrays(rv, stent_vertices, r_current, cap_height_fraction)
+
+@jit
+def _smin_sdf_capsule_contact_sculpt_arrays(
+    rv: Array, stent_vertices: Array,
+    r_current: float | Array,
+    cap_height_fraction: float,
+) -> tuple[Array, Array]:
+    """:func:`smin_sdf_capsule_contact_sculpt` on the array backends (JAX, NumPy)."""
     dist_to_surface_all, direction_all = _tapered_capsule_segment_distances(
         rv, stent_vertices, r_current, cap_height_fraction)
     # Vectorize the folding over all mesh points:
@@ -640,11 +683,52 @@ def stent_bounding_box(
     Array
         Boolean mask of length *N*.
     """
+    # Taken over into the backend in use, as in _tapered_capsule_segment_distances
+    data_points = jnp.asarray(data_points)
+    stent_vertices = jnp.asarray(stent_vertices)
+    min_coords, max_coords = _stent_bounding_box_corners(
+        stent_vertices, target_stent_radius, influence_radius, contact_distance)
+    mask = jnp.all((data_points >= min_coords) & (data_points <= max_coords), axis=1)
+    return mask
+
+def _stent_bounding_box_corners(
+    stent_vertices: Array, target_stent_radius: float | Array,
+    influence_radius: float, contact_distance: float,
+) -> tuple[Array, Array]:
+    """Corners of the stent's bounding box, padded by all that can reach beyond the stent axis."""
     max_stent_radius = jnp.max(jnp.asarray(target_stent_radius))
     min_coords = jnp.min(stent_vertices, axis=0) - max_stent_radius - influence_radius - contact_distance - 0.01 * L()
     max_coords = jnp.max(stent_vertices, axis=0) + max_stent_radius + influence_radius + contact_distance + 0.01 * L()
-    mask = jnp.all((data_points >= min_coords) & (data_points <= max_coords), axis=1)
-    return mask
+    return min_coords, max_coords
+
+def _compute_sdf_contact_displacements_warp(
+    data_points: Array, centerline_points: Array, stent_vertices: Array, s: float,
+    target_stent_radius: float | Array, current_stent_radius: float | Array,
+    influence_radius: float, contact_distance: float, f_scale: float, cap_height_fraction: float,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """:func:`compute_sdf_contact_displacements` under the Warp backend on a GPU: the whole step on the device.
+
+    Only the bounding box is worked out here, from the few vertices of the stent axis. Everything
+    that walks the mesh - the SDF, the points in contact, the nearest of them to each point, the
+    displacement - is a kernel in :mod:`svmorph.core.sdf_warp`, so the mesh goes to the device
+    once and its displacements come back once. Handing the SDF alone to Warp leaves a step that
+    is mostly SciPy's k-d tree and NumPy, however fast the kernel is.
+    """
+    from svmorph.core import sdf_warp
+
+    start_time = time.time()
+    stent_vertices = np.asarray(stent_vertices, dtype=float)
+    box_min, box_max = _stent_bounding_box_corners(
+        stent_vertices, np.asarray(target_stent_radius, dtype=float), influence_radius, contact_distance)
+    surface_displacements, centerline_displacements = sdf_warp.sdf_contact_displacements(
+        data_points, centerline_points, stent_vertices, current_stent_radius,
+        box_min=box_min, box_max=box_max, cap_height_fraction=cap_height_fraction,
+        # the smoothing radius smin_and_gradient uses when it is given none
+        smoothing=0.01 * L(),
+        contact_distance=contact_distance, influence_radius=influence_radius,
+        magnitude_scale=f_scale * (-s))
+    logger.timing(f"Warp deployment step: {time.time() - start_time:.4f} s")
+    return surface_displacements, centerline_displacements, f_scale * (-s)
 
 def compute_sdf_contact_displacements(
     data: dict, stent_vertices: Array,
@@ -716,6 +800,16 @@ def compute_sdf_contact_displacements(
     logger.debug(f"Selected pointId: {force_center_point_id}")
     data_points = data["points"]["surface"]
     centerline_points = data["points"]["centerline"]
+
+    if get_backend() == "warp":
+        from svmorph.core import sdf_warp
+
+        if sdf_warp.whole_step_on_device():
+            # Steps 2 to 9 below, as kernels. On a CPU the steps below run as they are, with the
+            # SDF of step 3 from Warp's kernel: sdf_warp.whole_step_on_device says why.
+            return _compute_sdf_contact_displacements_warp(
+                data_points, centerline_points, stent_vertices, s, target_stent_radius,
+                current_stent_radius, influence_radius, contact_distance, f_scale, cap_height_fraction)
 
     # ── 2. Bounding-box culling ──────────────────────────────────────
     # Restrict the expensive SDF evaluation to the axis-aligned bounding

@@ -22,8 +22,9 @@ virtual stenting method that mimics stent-wall interaction during deployment, an
 for virtual aneurysm and synthetic stenosis modeling.
 All heavy numerics are JIT-compiled with [JAX](https://github.com/jax-ml/jax) for
 real-time feedback on commodity hardware, and fall back to plain
-[NumPy](https://numpy.org/) where JAX cannot be installed (see
-[Array backend](#array-backend)).
+[NumPy](https://numpy.org/) where JAX cannot be installed. The stent's distance field
+can also be evaluated by [NVIDIA Warp](https://github.com/NVIDIA/warp), on a GPU where
+there is one (see [Array backend](#array-backend)).
 
 > **Citation guidance**
 > - If you use **SDFStent** (virtual stenting), please cite the **SDFStent paper** (reference forthcoming).
@@ -56,6 +57,7 @@ All four modes are available through both the **interactive GUI** (PyQt6 + VTK) 
 | SciPy | 1.10+ | KD-tree for influence-zone queries |
 | VTK | 9.3 | VTP mesh I/O and rendering |
 | JAX (CPU) | 0.4.30 | JIT compilation of the deformation kernels; not installed on Emscripten (WebAssembly), where NumPy is used |
+| Warp | 1.0+ | Optional (`pip install "svmorph[warp]"`) — the stent SDF as a kernel, on CUDA or the CPU; see [Array backend](#array-backend) |
 | PyQt6 | 6.7 | GUI only — not required for headless scripts |
 
 ---
@@ -470,26 +472,112 @@ svmorph/
 
 ### Array backend
 
-The kernels are written against `svmorph.backend`, which is JAX where JAX imports and NumPy
-where it does not. svMorph never differentiates anything — the gradients in the SDF kernels are
-written out by hand — so JAX is used here as a NumPy that compiles and vectorizes, and the
-package computes the same results without it, to about single-precision agreement (JAX computes
-in float32 by default, NumPy in float64).
+The kernels are written against `svmorph.backend`, which computes with one of three libraries:
+
+| Backend | What it is | Needs |
+|---|---|---|
+| `jax` | `jax.numpy`, compiled by XLA for the CPU. The default wherever JAX imports. | `jax` (installed with svMorph) |
+| `numpy` | The same expressions on NumPy. The default where JAX cannot be imported. | nothing more |
+| `warp` | Stent deployment as [NVIDIA Warp](https://github.com/NVIDIA/warp) kernels: on a CUDA GPU the whole deployment step, on a CPU the stent's SDF. The Kelvinlet kernels on NumPy. Only when asked for. | `pip install "svmorph[warp]"` |
+
+svMorph never differentiates anything — the gradients in the SDF kernels are written out by
+hand — so JAX is used here as a NumPy that compiles and vectorizes, and the package computes the
+same results without it, to about single-precision agreement (JAX and Warp compute in float32,
+NumPy in float64).
 
 That matters wherever JAX cannot go: `jaxlib` is XLA, built for a handful of platforms, and
 there is no WebAssembly build of it, so `import jax` fails in a browser — which is where
 [3D Slicer runs as SlicerWeb](https://github.com/Slicer/Slicer) through Pyodide — while NumPy
 and SciPy are there.
 
-Set `SVMORPH_BACKEND=numpy` in the environment to compute with NumPy even where JAX is
-installed; this is how the two backends are compared against each other:
+Warp is not an array library: it compiles kernels that run once per element. So it does not
+replace the array module; it replaces computations, each written out as a kernel
+(`svmorph/core/sdf_warp.py`). The first is the one whose cost is the mesh *times* the stent —
+every mesh point against every stent segment — which as arrays needs a `(points, segments, 3)`
+block of intermediates and as a kernel needs none. That alone makes a deployment step some
+thirty times faster than NumPy's and no more, however fast the kernel, because the rest of the
+step — SciPy's k-d tree for the nearest point in contact, and the NumPy assembly of the
+displacements — is then nearly all of it. So on a GPU the rest is kernels as well: the mesh goes
+to the device once per step and only its displacements come back.
+
+Warp has no nearest-neighbour search for point sets, only range queries, so the search for the
+nearest point in contact is kernels of svMorph's own as well. It rests on what a deployment has
+and a general search cannot count on: the points are the same from one step to the next, and only
+which of them are in contact changes. The surface points are sorted along a space-filling curve
+once, which makes a tree of them that is never built again; a step only works out the bounding
+box of the points in contact under each node, and searches. Warp's own searches were both
+measured against it — its nearest-point search on a triangle mesh, with each point in contact as
+a triangle a micrometre across, has to be rebuilt at every step and made a step about twice
+as long on a small mesh; its hash grid grows with the square of the mesh — and
+`sdf_warp.py` has the numbers. On a CPU, where Warp runs on one core and SciPy's tree on all of
+them, the step keeps SciPy and NumPy after Warp's SDF kernel. The Kelvinlet kernels are linear
+in the mesh, and run on NumPy under this backend.
+
+Choose the backend in the environment, before svMorph is imported, or from Python at any time:
 
 ```bash
-pytest tests                          # JAX, if it is installed
-SVMORPH_BACKEND=numpy pytest tests    # NumPy
+SVMORPH_BACKEND=warp svmorph-deploy-stent ...    # jax, numpy, warp, or auto
 ```
 
-The `core/` subpackage is **dependency-light** (NumPy and SciPy, with JAX if it is there) and carries
+```python
+from svmorph import backend
+
+backend.set_backend("warp")     # returns the name of the backend now in use
+backend.get_backend()           # "warp"
+backend.available_backends()    # ("jax", "numpy", "warp"): those whose library is installed
+backend.set_backend("auto")     # JAX where it imports, NumPy otherwise; never Warp
+```
+
+A backend that is named is the backend that is used: asking for one that cannot be imported
+raises `ImportError` instead of computing with another. Modules that imported `xp` or decorated
+a function with `jit` follow a later `set_backend`; arrays do not — one made by JAX stays a JAX
+array — so state kept across calls is best built again after a switch.
+
+Warp runs on its default device, the first CUDA device if there is one. `warp.set_device("cpu")`
+keeps it off the GPU.
+
+**How they compare.** One SDFStent deployment step on a tube mesh with a 30-segment stent in
+contact, in milliseconds, with the SDF evaluation alone in parentheses (20-thread Xeon,
+RTX 3090, Windows; compilation excluded):
+
+| Mesh points | NumPy | JAX (CPU) | Warp (CPU) | Warp (CUDA) | Warp (CUDA) against NumPy |
+|---:|---:|---:|---:|---:|---:|
+| 13 000 | 147 (103) | 14 (5.9) | 15 (6.1) | 0.6 (0.9) | 240× |
+| 50 000 | 698 (644) | 40 (21) | 44 (23) | 1.2 (1.0) | 600× |
+| 200 000 | 2 731 (2 636) | 146 (87) | 203 (109) | 3.5 (3.9) | 770× |
+| 1 000 000 | 12 802 (11 388) | 775 (438) | 903 (538) | 14 (17) | 920× |
+
+The meshes here are double precision, as NumPy makes them. Handed single-precision points — which
+is what a VTK mesh holds — the Warp step skips a conversion and takes 0.6, 1.0, 2.4 and 9 ms.
+(The SDF alone is timed as a call of its own, which carries its points to the device and its
+results back as a step does, and allocates what a step keeps: that is how it comes to take as
+long as a whole step.)
+
+The SDF is all of a NumPy step and half of a JAX one. Warp's kernel on a single CPU core keeps
+up with JAX on all of them; on a GPU it is several hundred times faster than NumPy, and with the
+rest of the step on the device as well a whole step is too.
+
+What a GPU step is made of is no longer arithmetic. The kernels themselves take a third of a
+millisecond on a small mesh and two or three on a million points. The rest is getting the mesh
+to the device and its displacements back: a third of the step on a small mesh and two thirds of
+it on a large one. A step on a small mesh still costs half a millisecond however little there is
+to compute, so the gain over NumPy is smallest there. To keep it at that, the device arrays and
+the kernel launches are kept from one step to the next, the search tree is kept with them and
+only refitted, nothing is read back from the device in the middle of a step, and nothing is
+converted to double precision on the way back.
+
+The first call compiles: about a second for JAX, about four for Warp on the CPU and about one on
+CUDA, after which Warp reads its kernels from a cache.
+
+The test suite runs the kernels under every backend that is installed, and checks them against
+each other:
+
+```bash
+pip install ".[dev,warp]"
+pytest tests
+```
+
+The `core/` subpackage is **dependency-light** (NumPy and SciPy, with JAX and Warp if they are there) and carries
 no VTK or Qt dependency, making it straightforward for downstream tools — such as
 [3D Slicer](https://www.slicer.org/) extensions or [ParaView](https://www.paraview.org/)
 plugins — to import and build upon the deformation engine independently:
