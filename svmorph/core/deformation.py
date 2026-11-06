@@ -10,7 +10,9 @@ JAX and NumPy both do the work in compiled code.  Under Warp the
 capsule-chain SDF - the one computation here that is every mesh point
 against every stent segment - is a kernel (svmorph.core.sdf_warp), and
 on a GPU so is the whole stent deployment step; the Kelvinlet kernels,
-which are linear in the mesh, run on NumPy.
+which are linear in the mesh, run on NumPy.  Where JAX computes on a
+GPU the whole deployment step is likewise one compiled function
+(svmorph.core.sdf_jax).
 """
 
 from __future__ import annotations
@@ -693,41 +695,65 @@ def stent_bounding_box(
 
 def _stent_bounding_box_corners(
     stent_vertices: Array, target_stent_radius: float | Array,
-    influence_radius: float, contact_distance: float,
+    influence_radius: float, contact_distance: float, xp=jnp,
 ) -> tuple[Array, Array]:
-    """Corners of the stent's bounding box, padded by all that can reach beyond the stent axis."""
-    max_stent_radius = jnp.max(jnp.asarray(target_stent_radius))
-    min_coords = jnp.min(stent_vertices, axis=0) - max_stent_radius - influence_radius - contact_distance - 0.01 * L()
-    max_coords = jnp.max(stent_vertices, axis=0) + max_stent_radius + influence_radius + contact_distance + 0.01 * L()
+    """Corners of the stent's bounding box, padded by all that can reach beyond the stent axis.
+
+    *xp* is the array module they are worked out with: the backend's inside a compiled function,
+    NumPy where they are wanted on the host - a handful of numbers, which a GPU backend would
+    otherwise compute on the device one small operation at a time and hand back, for longer than
+    the rest of a step on a small mesh takes.
+    """
+    max_stent_radius = xp.max(xp.asarray(target_stent_radius))
+    min_coords = xp.min(stent_vertices, axis=0) - max_stent_radius - influence_radius - contact_distance - 0.01 * L()
+    max_coords = xp.max(stent_vertices, axis=0) + max_stent_radius + influence_radius + contact_distance + 0.01 * L()
     return min_coords, max_coords
 
-def _compute_sdf_contact_displacements_warp(
+def _whole_step_module():
+    """The module that computes a whole deployment step on a device, under the backend in use; or None.
+
+    :mod:`svmorph.core.sdf_warp` under Warp and :mod:`svmorph.core.sdf_jax` under JAX, each where
+    its ``whole_step_on_device`` says the device is one to do it on - a GPU. Imported here and
+    not at the top of the module: each imports its library, which is there only where its backend
+    was asked for, and Warp's initialises a runtime.
+    """
+    name = get_backend()
+    if name == "warp":
+        from svmorph.core import sdf_warp as module
+    elif name == "jax":
+        from svmorph.core import sdf_jax as module
+    else:
+        return None
+    return module if module.whole_step_on_device() else None
+
+def _compute_sdf_contact_displacements_on_device(
+    module,
     data_points: Array, centerline_points: Array, stent_vertices: Array, s: float,
     target_stent_radius: float | Array, current_stent_radius: float | Array,
     influence_radius: float, contact_distance: float, f_scale: float, cap_height_fraction: float,
 ) -> tuple[np.ndarray, np.ndarray, float]:
-    """:func:`compute_sdf_contact_displacements` under the Warp backend on a GPU: the whole step on the device.
+    """:func:`compute_sdf_contact_displacements` with the whole step on a GPU, by *module*.
 
     Only the bounding box is worked out here, from the few vertices of the stent axis. Everything
     that walks the mesh - the SDF, the points in contact, the nearest of them to each point, the
-    displacement - is a kernel in :mod:`svmorph.core.sdf_warp`, so the mesh goes to the device
-    once and its displacements come back once. Handing the SDF alone to Warp leaves a step that
-    is mostly SciPy's k-d tree and NumPy, however fast the kernel is.
+    displacement - is on the device: kernels in :mod:`svmorph.core.sdf_warp`, one compiled
+    function in :mod:`svmorph.core.sdf_jax`. The mesh goes to the device once and its
+    displacements come back once. Handing the SDF alone to the device leaves a step that is
+    mostly SciPy's k-d tree and NumPy, however fast the SDF is.
     """
-    from svmorph.core import sdf_warp
-
     start_time = time.time()
     stent_vertices = np.asarray(stent_vertices, dtype=float)
     box_min, box_max = _stent_bounding_box_corners(
-        stent_vertices, np.asarray(target_stent_radius, dtype=float), influence_radius, contact_distance)
-    surface_displacements, centerline_displacements = sdf_warp.sdf_contact_displacements(
+        stent_vertices, np.asarray(target_stent_radius, dtype=float), influence_radius, contact_distance,
+        xp=np)
+    surface_displacements, centerline_displacements = module.sdf_contact_displacements(
         data_points, centerline_points, stent_vertices, current_stent_radius,
         box_min=box_min, box_max=box_max, cap_height_fraction=cap_height_fraction,
         # the smoothing radius smin_and_gradient uses when it is given none
         smoothing=0.01 * L(),
         contact_distance=contact_distance, influence_radius=influence_radius,
         magnitude_scale=f_scale * (-s))
-    logger.timing(f"Warp deployment step: {time.time() - start_time:.4f} s")
+    logger.timing(f"Deployment step on the device: {time.time() - start_time:.4f} s")
     return surface_displacements, centerline_displacements, f_scale * (-s)
 
 def compute_sdf_contact_displacements(
@@ -801,15 +827,13 @@ def compute_sdf_contact_displacements(
     data_points = data["points"]["surface"]
     centerline_points = data["points"]["centerline"]
 
-    if get_backend() == "warp":
-        from svmorph.core import sdf_warp
-
-        if sdf_warp.whole_step_on_device():
-            # Steps 2 to 9 below, as kernels. On a CPU the steps below run as they are, with the
-            # SDF of step 3 from Warp's kernel: sdf_warp.whole_step_on_device says why.
-            return _compute_sdf_contact_displacements_warp(
-                data_points, centerline_points, stent_vertices, s, target_stent_radius,
-                current_stent_radius, influence_radius, contact_distance, f_scale, cap_height_fraction)
+    whole_step_module = _whole_step_module()
+    if whole_step_module is not None:
+        # Steps 2 to 9 below, on a GPU. On a CPU the steps below run as they are, with the SDF of
+        # step 3 from the backend: each module's whole_step_on_device says why.
+        return _compute_sdf_contact_displacements_on_device(
+            whole_step_module, data_points, centerline_points, stent_vertices, s, target_stent_radius,
+            current_stent_radius, influence_radius, contact_distance, f_scale, cap_height_fraction)
 
     # ── 2. Bounding-box culling ──────────────────────────────────────
     # Restrict the expensive SDF evaluation to the axis-aligned bounding

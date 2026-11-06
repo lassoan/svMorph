@@ -476,7 +476,7 @@ The kernels are written against `svmorph.backend`, which computes with one of th
 
 | Backend | What it is | Needs |
 |---|---|---|
-| `jax` | `jax.numpy`, compiled by XLA for the CPU. The default wherever JAX imports. | `jax` (installed with svMorph) |
+| `jax` | `jax.numpy`, compiled by XLA: the kernels on a CPU, and the whole stent deployment step where JAX has a GPU. The default wherever JAX imports. | `jax` (installed with svMorph) |
 | `numpy` | The same expressions on NumPy. The default where JAX cannot be imported. | nothing more |
 | `warp` | Stent deployment as [NVIDIA Warp](https://github.com/NVIDIA/warp) kernels: on a CUDA GPU the whole deployment step, on a CPU the stent's SDF. The Kelvinlet kernels on NumPy. Only when asked for. | `pip install "svmorph[warp]"` |
 
@@ -513,6 +513,26 @@ as long on a small mesh; its hash grid grows with the square of the mesh — and
 them, the step keeps SciPy and NumPy after Warp's SDF kernel. The Kelvinlet kernels are linear
 in the mesh, and run on NumPy under this backend.
 
+Where JAX itself computes on a GPU — `jax.default_backend()` is not `"cpu"` — the whole
+deployment step is one compiled function as well (`svmorph/core/sdf_jax.py`), for the same
+reason: with the SDF alone on the device, nine tenths of a step was the host's k-d tree and
+NumPy. It cannot be Warp's search. A tree walked point by point, each point stopping when it has
+its answer, is a loop per element, which JAX has not got: under `vmap` every point runs for as
+long as the slowest of them. So the same tree is descended a level at a time by all of the points
+at once, every node keeping a list, of fixed width, of the nodes that could hold its nearest
+point in contact. A list that proves too narrow is detected, and the step is computed again with
+wider ones, so the distances are as exact as Warp's. This does several times the arithmetic of a
+walk, which a GPU absorbs — the step is five to sixteen times shorter than with the SDF alone on
+the device, and within a factor of four of Warp's — and a CPU does not: there it is seven times
+slower than SciPy's tree, so JAX on a CPU keeps the step as it was.
+
+JAX has no GPU build of its own for Windows. The unofficial
+[winjax](https://pypi.org/project/winjax/) supplies one, and the JAX (CUDA) figures below were
+measured with it. Its prebuilt CUDA kernels target RTX 50-series cards; on the RTX 3090 used here
+they fail with `cudaErrorNoKernelImageForDevice`, and since the check XLA's autotuner runs is one
+of them, every reduction fails until `XLA_FLAGS=--xla_gpu_autotune_level=0` is set before JAX is
+imported. XLA's sort and top-k are among them too, and svMorph's step uses neither.
+
 Choose the backend in the environment, before svMorph is imported, or from Python at any time:
 
 ```bash
@@ -540,12 +560,12 @@ keeps it off the GPU.
 contact, in milliseconds, with the SDF evaluation alone in parentheses (20-thread Xeon,
 RTX 3090, Windows; compilation excluded):
 
-| Mesh points | NumPy | JAX (CPU) | Warp (CPU) | Warp (CUDA) | Warp (CUDA) against NumPy |
-|---:|---:|---:|---:|---:|---:|
-| 13 000 | 147 (103) | 14 (5.9) | 15 (6.1) | 0.6 (0.9) | 240× |
-| 50 000 | 698 (644) | 40 (21) | 44 (23) | 1.2 (1.0) | 600× |
-| 200 000 | 2 731 (2 636) | 146 (87) | 203 (109) | 3.5 (3.9) | 770× |
-| 1 000 000 | 12 802 (11 388) | 775 (438) | 903 (538) | 14 (17) | 920× |
+| Mesh points | NumPy | JAX (CPU) | Warp (CPU) | JAX (CUDA) | Warp (CUDA) | Warp (CUDA) against NumPy |
+|---:|---:|---:|---:|---:|---:|---:|
+| 13 000 | 147 (103) | 14 (5.9) | 15 (6.1) | 2.2 (1.8) | 0.6 (0.9) | 240× |
+| 50 000 | 698 (644) | 40 (21) | 44 (23) | 3.1 (2.1) | 1.2 (1.0) | 600× |
+| 200 000 | 2 731 (2 636) | 146 (87) | 203 (109) | 6.2 (5.9) | 3.5 (3.9) | 770× |
+| 1 000 000 | 12 802 (11 388) | 775 (438) | 903 (538) | 25 (28) | 14 (17) | 920× |
 
 The meshes here are double precision, as NumPy makes them. Handed single-precision points — which
 is what a VTK mesh holds — the Warp step skips a conversion and takes 0.6, 1.0, 2.4 and 9 ms.
@@ -555,7 +575,9 @@ long as a whole step.)
 
 The SDF is all of a NumPy step and half of a JAX one. Warp's kernel on a single CPU core keeps
 up with JAX on all of them; on a GPU it is several hundred times faster than NumPy, and with the
-rest of the step on the device as well a whole step is too.
+rest of the step on the device as well a whole step is too. JAX on a GPU is 70 to 500 times
+faster than NumPy and behind Warp throughout: by a factor of four on a small mesh and by less
+than two on a million points.
 
 What a GPU step is made of is no longer arithmetic. The kernels themselves take a third of a
 millisecond on a small mesh and two or three on a million points. The rest is getting the mesh
@@ -566,8 +588,9 @@ the kernel launches are kept from one step to the next, the search tree is kept 
 only refitted, nothing is read back from the device in the middle of a step, and nothing is
 converted to double precision on the way back.
 
-The first call compiles: about a second for JAX, about four for Warp on the CPU and about one on
-CUDA, after which Warp reads its kernels from a cache.
+The first call compiles: about a second for JAX on a CPU and two to five for its whole step on a
+GPU (again for every mesh of another size), about four for Warp on the CPU and about one on CUDA,
+after which Warp reads its kernels from a cache.
 
 The test suite runs the kernels under every backend that is installed, and checks them against
 each other:

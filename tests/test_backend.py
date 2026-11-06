@@ -392,3 +392,103 @@ def test_warp_contact_search_is_exact_in_an_order_sorted_for_other_points(warp_d
     assert sdf_warp._step_buffers.steps_since_sort == 2, "the second step should not have sorted again"
     np.testing.assert_allclose(moved, expected_surface, atol=2e-6)
     np.testing.assert_allclose(movable, expected_centerline, atol=2e-6)
+
+
+# ── JAX: the whole step as one compiled function ─────────────────────────────
+
+@pytest.fixture
+def jax_whole_step(restore_backend, monkeypatch):
+    """The step JAX takes on a GPU (svmorph.core.sdf_jax), on whatever device JAX has here.
+
+    On a CPU - a CI runner - compute_sdf_contact_displacements does not take this route
+    (sdf_jax.whole_step_on_device), and it would go untested. It computes the same there, only
+    slower than the route that is taken. What a step keeps for the next is forgotten first, so
+    that no test begins with the order or the list widths another left.
+    """
+    if "jax" not in backend.available_backends():
+        pytest.skip("jax is not installed")
+    from svmorph.core import sdf_jax
+
+    backend.set_backend("jax")
+    monkeypatch.setattr(sdf_jax, "whole_step_on_device", lambda: True)
+    monkeypatch.setattr(sdf_jax, "_step_state", None)
+    return sdf_jax
+
+
+def test_jax_whole_step_agrees_with_numpy(jax_whole_step, monkeypatch):
+    calls = []
+    whole_step = jax_whole_step.sdf_contact_displacements
+    monkeypatch.setattr(jax_whole_step, "sdf_contact_displacements",
+                        lambda *args, **kwargs: calls.append(1) or whole_step(*args, **kwargs))
+
+    expected_surface, expected_centerline, expected_step = _numpy_reference(_flared_deployment_step)
+    surface, centerline, step = _flared_deployment_step()
+
+    assert calls, "the step should have been computed by sdf_jax"
+    moved = np.linalg.norm(expected_surface, axis=1)
+    assert 0.1 < np.count_nonzero(moved) / len(moved) < 0.9, "the stent should touch part of the tube"
+    assert surface.shape == expected_surface.shape and centerline.shape == expected_centerline.shape
+    np.testing.assert_allclose(surface, expected_surface, atol=2e-6)
+    np.testing.assert_allclose(centerline, expected_centerline, atol=2e-6)
+    assert step == pytest.approx(expected_step)
+
+
+def test_jax_whole_step_moves_nothing_before_contact(jax_whole_step):
+    surface, centerline, _ = _deployment_step(0.3)
+    data = _tube()
+    assert surface.shape == data["points"]["surface"].shape and not surface.any()
+    assert centerline.shape == data["points"]["centerline"].shape and not centerline.any()
+
+
+def _jax_tree_sizes():
+    """Numbers of points on either side of where the tree gains a leaf or a level."""
+    if "jax" not in backend.available_backends():
+        return [1]
+    from svmorph.core import sdf_jax
+
+    leaf, branching, top = sdf_jax._LEAF_SIZE, sdf_jax._BRANCHING, sdf_jax._MAX_TOP_NODES
+    return [1, leaf - 1, leaf + 1, leaf * top, leaf * top + 1, leaf * top * branching + 1]
+
+
+@pytest.mark.parametrize("number_of_points", _jax_tree_sizes())
+def test_jax_contact_search_agrees_with_numpy_on_scattered_points(jax_whole_step, number_of_points):
+    surface, centerline, stent_vertices, stent_radius, arguments, expected_surface, expected_centerline = (
+        _scattered_step(number_of_points, seed=number_of_points))
+    moved, movable = jax_whole_step.sdf_contact_displacements(
+        surface, centerline, stent_vertices, stent_radius, **arguments)
+    if number_of_points > 100:
+        weights = np.linalg.norm(expected_surface, axis=1) / 0.01
+        assert np.count_nonzero((weights > 0.05) & (weights < 0.95)) > number_of_points / 20, (
+            "some points should be at a distance from the contact front, where the search decides")
+    np.testing.assert_allclose(moved, expected_surface, atol=2e-6)
+    np.testing.assert_allclose(movable, expected_centerline, atol=2e-6)
+
+
+def test_jax_contact_search_is_exact_in_an_order_sorted_for_other_points(jax_whole_step):
+    # As under Warp: the order is kept while the points move, and for the next deployment on a
+    # mesh of the same size. It may be a poor order by then; it must not be a wrong one.
+    number_of_points = 3000
+    first = _scattered_step(number_of_points, seed=1)
+    jax_whole_step.sdf_contact_displacements(*first[:4], **first[4])
+
+    surface, centerline, stent_vertices, stent_radius, arguments, expected_surface, expected_centerline = (
+        _scattered_step(number_of_points, seed=2))
+    moved, movable = jax_whole_step.sdf_contact_displacements(
+        surface, centerline, stent_vertices, stent_radius, **arguments)
+    assert jax_whole_step._step_state.steps_since_sort == 2, "the second step should not have sorted again"
+    np.testing.assert_allclose(moved, expected_surface, atol=2e-6)
+    np.testing.assert_allclose(movable, expected_centerline, atol=2e-6)
+
+
+def test_jax_contact_search_widens_lists_that_are_too_narrow(jax_whole_step, monkeypatch):
+    # The lists of candidates are of a guessed width. A guess that is too small must cost a
+    # second computation, never a nearest point that was not on the list.
+    monkeypatch.setattr(jax_whole_step, "_INITIAL_WIDTHS", (1, 1, 1))
+    number_of_points = jax_whole_step._LEAF_SIZE * jax_whole_step._MAX_TOP_NODES * jax_whole_step._BRANCHING + 1
+    surface, centerline, stent_vertices, stent_radius, arguments, expected_surface, expected_centerline = (
+        _scattered_step(number_of_points, seed=3))
+    moved, movable = jax_whole_step.sdf_contact_displacements(
+        surface, centerline, stent_vertices, stent_radius, **arguments)
+    assert all(width > 1 for width in jax_whole_step._step_state.widths), "every list should have been too narrow"
+    np.testing.assert_allclose(moved, expected_surface, atol=2e-6)
+    np.testing.assert_allclose(movable, expected_centerline, atol=2e-6)
